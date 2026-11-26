@@ -202,6 +202,7 @@ def _routing_search(data, incumbent, deadline):
     parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     parameters.time_limit.FromMilliseconds(max(1, int((deadline-time.monotonic())*1000)))
     parameters.log_search = False
+    routing.CloseModelWithParameters(parameters)
     # The exact-distance seed can be infeasible after conservative rounding;
     # discard only the rounded assignment, retaining the valid external seed.
     assignment = routing.ReadAssignmentFromRoutes([r[1:-1] for r in incumbent], True) if incumbent else None

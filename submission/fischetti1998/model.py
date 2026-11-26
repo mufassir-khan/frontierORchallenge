@@ -3,7 +3,8 @@
 All cities are optional except the depot; a hard route-length dimension enforces
 its budget and a cardinality constraint requires two nondepot visits. Dropping a
 city costs prize * (budget + 1), making collected prize the primary objective and
-travel length the secondary objective. OR-Tools improves a verified seed tour.
+travel length the secondary objective. PyVRP improves large-instance seeds
+when installed; OR-Tools remains the fallback. Every returned tour is validated.
 """
 from __future__ import annotations
 
@@ -213,7 +214,10 @@ def solve(instance, time_limit=56.0, seed=0):
     if time.monotonic() >= deadline or problem.value(best) == sum(problem.prize):
         return problem.output(best)
     if problem.size > 60 and deadline - time.monotonic() > 1:
-        candidate = problem.genetic_candidate(best, deadline - 0.1, seed)
+        try:
+            candidate = problem.genetic_candidate(best, deadline - 0.1, seed)
+        except (ImportError, ValueError, RuntimeError, TypeError, AttributeError):
+            candidate = None  # Optional acceleration must not discard a feasible tour.
         if candidate is not None:
             return problem.output(candidate)
 

@@ -1,4 +1,7 @@
-"""Expanded-node divisible-delivery routing using constrained local search.
+"""Expanded-node delivery routing with offline VROOM/PyVRP candidates.
+
+Optional engines warm-start and improve a validated route plan. OR-Tools is
+the dependency-free fallback within the challenge image.
 
 Two cumulative dimensions jointly model the physical load. The amount loaded at
 route departure equals all deliveries assigned to that route. The signed cargo
@@ -182,11 +185,17 @@ def solve(instance, time_limit=56.0, seed=0):
     best = problem.starting_routes(deadline, seed)
     remaining = deadline - time.monotonic()
     if remaining > 1:
-        candidate = problem.vroom_candidate(min(12.0, remaining * 0.25))
+        try:
+            candidate = problem.vroom_candidate(min(12.0, remaining * 0.25))
+        except (ImportError, ValueError, RuntimeError, TypeError, AttributeError):
+            candidate = None  # Keep the validated seed if an optional engine fails.
         if candidate is not None and sum(map(problem.cost, candidate)) < sum(map(problem.cost, best)):
             best = candidate
     if deadline - time.monotonic() > 1:
-        candidate = problem.genetic_candidate(best, deadline - 0.1, seed)
+        try:
+            candidate = problem.genetic_candidate(best, deadline - 0.1, seed)
+        except (ImportError, ValueError, RuntimeError, TypeError, AttributeError):
+            candidate = None
         if candidate is not None:
             if sum(map(problem.cost, candidate)) < sum(map(problem.cost, best)):
                 best = candidate

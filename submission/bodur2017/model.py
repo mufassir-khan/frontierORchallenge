@@ -81,9 +81,11 @@ class FacilityProblem:
                     and np.all(allocation.sum(axis=0) >= self.demand[k] - 1e-7)
                     and np.all(allocation.sum(axis=1) <= self.capacity * opened + 1e-7))
 
-    def representatives(self, seed):
+    def representatives(self, seed, sample_limit=None):
         """Weighted strata preserve probability mass, including zero-probability inputs."""
         limit = min(self.s, max(6, min(16, 24000 // (self.f * self.c))))
+        if sample_limit is not None:
+            limit = min(self.s, sample_limit)
         if self.s <= limit:
             return np.arange(self.s), self.probability.copy()
         rng = np.random.default_rng(seed)
@@ -101,8 +103,8 @@ class FacilityProblem:
             weights.append(total)
         return np.asarray(selected), np.asarray(weights)
 
-    def plan_openings(self, deadline, seed):
-        sample, weights = self.representatives(seed)
+    def plan_openings(self, deadline, seed, sample_limit=None):
+        sample, weights = self.representatives(seed, sample_limit)
         m = len(sample)
         current = np.ones(self.f, dtype=int)
         best, best_value = current.copy(), math.inf
@@ -209,4 +211,27 @@ def solve(instance, time_limit=56.0, seed=0):
             if (problem.valid_shipments(opened, k, allocation)
                     and np.sum(problem.cost * allocation) <= np.sum(problem.cost * shipments[k]) + 1e-7):
                 shipments[k] = allocation
-    return problem.serialize(opened, shipments)
+    incumbent = problem.serialize(opened, shipments)
+    # Spend spare time checking a richer scenario approximation. Compare both
+    # plans using the actual full scenario distribution, not sampled objectives.
+    remaining = deadline - time.monotonic()
+    if problem.s > 16 and remaining > 8:
+        candidate = problem.plan_openings(time.monotonic() + min(remaining * 0.35, 12),
+                                          seed, sample_limit=32)
+        if not np.any(candidate):
+            candidate[int(np.argmin(problem.fixed))] = 1
+        if not np.array_equal(opened, candidate):
+            alternative = [problem.greedy(candidate, k) for k in range(problem.s)]
+            for k in np.argsort(-problem.probability, kind='stable'):
+                remaining = deadline - time.monotonic()
+                if remaining < 1.5:
+                    break
+                result = problem.transport(candidate, int(k), min(remaining * 0.8, 0.5))
+                if result is not None:
+                    allocation = np.maximum(result[0], 0)
+                    if problem.valid_shipments(candidate, k, allocation):
+                        alternative[k] = allocation
+            proposed = problem.serialize(candidate, alternative)
+            if proposed['objective_value'] < incumbent['objective_value']:
+                incumbent = proposed
+    return incumbent

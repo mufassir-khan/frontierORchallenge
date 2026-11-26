@@ -1,0 +1,5 @@
+# Add these lines to the challenge's Extra packages field when submitting.
+# The runtime does not install packages from this file; routing falls back to
+# the preinstalled OR-Tools if these optional accelerators are absent.
+pyvroom==1.15.2
+pyvrp==0.14.0
