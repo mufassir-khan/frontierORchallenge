@@ -261,7 +261,7 @@ def solve(instance, time_limit=56.0, seed=0):
     # commodity differently to avoid the capacity bottlenecks of greedy packing.
     pricing_deadline = started + time_limit*0.38
     shadow = np.zeros(net.m)
-    for iteration in range(12):
+    for iteration in range(40):
         if time.monotonic() >= pricing_deadline:
             break
         added = False
@@ -280,11 +280,13 @@ def solve(instance, time_limit=56.0, seed=0):
         if not lp.success:
             break
         shadow = np.maximum(0, -lp.ineqlin.marginals[:net.m])
-    if master.paths and time.monotonic() < deadline:
+    def pack(stop):
+        if not master.paths or time.monotonic() >= stop:
+            return
         matrix, objective, limit = master.matrix()
         result = milp(objective, integrality=np.ones(len(master.paths)), bounds=Bounds(0, 1),
                       constraints=LinearConstraint(matrix, -np.inf, limit),
-                      options={'time_limit': max(0.001, deadline-time.monotonic()), 'mip_rel_gap': 0.0})
+                      options={'time_limit': max(0.001, stop-time.monotonic()), 'mip_rel_gap': 0.0})
         if result.x is not None:
             candidate = [None] * len(net.requests)
             unique = True
@@ -296,4 +298,39 @@ def solve(instance, time_limit=56.0, seed=0):
                 candidate[k] = route
             if unique:
                 retain(candidate)
+
+    # First packing identifies which arcs the current integer decisions saturate.
+    # Repair many randomized residual networks to discover paths that the LP's
+    # single shortest-path price misses (important for unsplittable demands).
+    pack(min(deadline, started + time_limit * 0.55))
+    repair_stop = started + time_limit * 0.76
+    for iteration in range(160):
+        if time.monotonic() >= repair_stop:
+            break
+        candidate = best[:]
+        accepted = [k for k, route in enumerate(candidate) if route is not None]
+        removed = set(rng.sample(accepted, min(len(accepted), max(1, int(len(accepted)*rng.uniform(0.15,0.5))))))
+        available = net.capacity.copy()
+        for k, route in enumerate(candidate):
+            if k in removed:
+                candidate[k] = None
+            elif route is not None:
+                for edge in route:
+                    available[edge] -= net.requests[k].demand
+        pending = [k for k, route in enumerate(candidate) if route is None]
+        rng.shuffle(pending)
+        pending.sort(key=lambda k: -net.requests[k].rejection / max(1,net.requests[k].demand)**rng.choice([0,0.5,1]) * rng.uniform(0.7,1.3))
+        for k in pending:
+            if time.monotonic() >= repair_stop:
+                break
+            request = net.requests[k]
+            weights = net.cost + shadow*rng.uniform(0,1.5) + (1+np.array([rng.random() for _ in range(net.m)]))/np.maximum(available,0.25)
+            path = net.shortest_path(request, available, weights)
+            master.add(k, path)
+            if path is not None and net.route_cost(k,path) <= request.rejection:
+                candidate[k] = path
+                for edge in path:
+                    available[edge] -= request.demand
+        retain(candidate)
+    pack(deadline)
     return net.output(best)

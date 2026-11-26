@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from datetime import timedelta
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
@@ -109,6 +110,69 @@ class DeliveryRouting:
         return {'objective_value': float(sum(self.cost(route) for route in routes)),
                 'routes': full, 'routes_detailed': details}
 
+    def repair_colocated_order(self, routes):
+        # Reversing an adjacent own-pickup/own-delivery pair leaves distance
+        # unchanged and weakly decreases the intervening onboard load.
+        for route in routes:
+            for position in range(len(route) - 1):
+                if route[position] > self.n and route[position] - self.n == route[position + 1]:
+                    route[position], route[position + 1] = route[position + 1], route[position]
+        return routes
+
+    def vroom_candidate(self, seconds):
+        """Optional PyPI VROOM binding: offline matrices, no routing server."""
+        try:
+            import vroom
+        except ImportError:
+            return None
+        model = vroom.Input()
+        model.set_durations_matrix(profile='car', matrix_input=self.distance)
+        model.add_vehicle([vroom.Vehicle(vehicle, start=0, end=0, capacity=[self.capacity])
+                           for vehicle in range(self.n)])
+        model.add_job([vroom.Job(node, location=node, delivery=[self.delivery[node]],
+                                pickup=[self.pickup[node]]) for node in range(1, 2 * self.n + 1)])
+        result = model.solve(exploration_level=5, nb_threads=2,
+                             timeout=timedelta(seconds=max(0.01, seconds))).to_dict()
+        if result.get('unassigned'):
+            return None
+        routes = [[step['id'] for step in route['steps'] if step['type'] == 'job']
+                  for route in result.get('routes', [])]
+        routes = self.repair_colocated_order([route for route in routes if route])
+        self.output(routes)
+        return routes
+
+    def genetic_candidate(self, incumbent, deadline, seed):
+        """Optional PyVRP hybrid genetic search, seeded by a feasible plan."""
+        try:
+            import pyvrp
+            from pyvrp.stop import MaxRuntime
+        except ImportError:
+            return None
+        model = pyvrp.Model()
+        locations = [model.add_location(0, 0) for _ in self.distance]
+        model.add_depot(locations[0])
+        for node in range(1, 2 * self.n + 1):
+            model.add_client(locations[node], delivery=self.delivery[node], pickup=self.pickup[node])
+        model.add_vehicle_type(num_available=self.n, capacity=self.capacity)
+        for a, row in enumerate(self.distance):
+            for b, cost in enumerate(row):
+                model.add_edge(locations[a], locations[b], distance=cost)
+        data = model.data()
+        warm = pyvrp.Solution(data, [pyvrp.Route(data, [pyvrp.Activity(pyvrp.ActivityType.CLIENT, node - 1)
+                                  for node in route], 0) for route in incumbent])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.02:
+            return incumbent
+        result = model.solve(stop=MaxRuntime(remaining), seed=seed, display=False,
+                             collect_stats=False, initial_solution=warm)
+        if not result.best.is_feasible():
+            return incumbent
+        routes = [[activity.idx + 1 for activity in route if activity.is_client()]
+                  for route in result.best.routes()]
+        routes = self.repair_colocated_order(routes)
+        self.output(routes)
+        return routes
+
 
 def solve(instance, time_limit=56.0, seed=0):
     if not math.isfinite(time_limit) or time_limit <= 0:
@@ -116,6 +180,17 @@ def solve(instance, time_limit=56.0, seed=0):
     deadline = time.monotonic() + time_limit
     problem = DeliveryRouting(instance)
     best = problem.starting_routes(deadline, seed)
+    remaining = deadline - time.monotonic()
+    if remaining > 1:
+        candidate = problem.vroom_candidate(min(12.0, remaining * 0.25))
+        if candidate is not None and sum(map(problem.cost, candidate)) < sum(map(problem.cost, best)):
+            best = candidate
+    if deadline - time.monotonic() > 1:
+        candidate = problem.genetic_candidate(best, deadline - 0.1, seed)
+        if candidate is not None:
+            if sum(map(problem.cost, candidate)) < sum(map(problem.cost, best)):
+                best = candidate
+            return problem.output(best)
     if time.monotonic() >= deadline:
         return problem.output(best)
     # A customer-by-customer service is always feasible with at most n vehicles.

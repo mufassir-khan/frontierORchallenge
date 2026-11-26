@@ -170,15 +170,14 @@ def _routing_search(data, incumbent, deadline):
     horizon = ceil(max(data.late)-shift)+1
     manager = pywrapcp.RoutingIndexManager(data.end+1, data.m, [0]*data.m, [data.end]*data.m)
     routing = pywrapcp.RoutingModel(manager)
-    index_nodes = [manager.IndexToNode(i) for i in range(manager.GetNumberOfIndices())]
     metric = [[int(round(v*10000)) for v in row] for row in data.distance]
     transit = [[ceil(data.service[a]+data.distance[a][b]) for b in range(data.end+1)] for a in range(data.end+1)]
-    cost_callback = routing.RegisterTransitCallback(lambda a,b: metric[index_nodes[a]][index_nodes[b]])
+    cost_callback = routing.RegisterTransitMatrix(metric)
     routing.SetArcCostEvaluatorOfAllVehicles(cost_callback)
-    time_callback = routing.RegisterTransitCallback(lambda a,b: transit[index_nodes[a]][index_nodes[b]])
+    time_callback = routing.RegisterTransitMatrix(transit)
     routing.AddDimension(time_callback, horizon, horizon, False, 'Time')
     clock = routing.GetDimensionOrDie('Time')
-    load_callback = routing.RegisterUnaryTransitCallback(lambda a: data.load[index_nodes[a]])
+    load_callback = routing.RegisterUnaryTransitVector(data.load)
     routing.AddDimensionWithVehicleCapacity(load_callback, 0, [data.capacity]*data.m, True, 'Passengers')
     cp = routing.solver()
     penalty = max(1, sum(max(row) for row in metric)) * 100

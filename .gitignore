@@ -2,3 +2,4 @@
 *.zip
 tests/
 .DS_store
+__pycache__/

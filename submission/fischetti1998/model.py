@@ -166,6 +166,40 @@ class Orienteering:
                 'edges': [[a, b] for a, b in zip(nodes, nodes[1:])],
                 'tour': nodes}
 
+    def genetic_candidate(self, incumbent, deadline, seed):
+        try:
+            import pyvrp
+            from pyvrp.stop import MaxRuntime
+        except ImportError:
+            return None
+        model = pyvrp.Model()
+        locations = [model.add_location(0, 0) for _ in self.distance]
+        model.add_depot(locations[self.depot])
+        clients = [node for node in range(self.size) if node != self.depot]
+        client_index = {node: index for index, node in enumerate(clients)}
+        for node in clients:
+            model.add_client(locations[node], prize=self.prize[node] * (self.budget + 1), required=False)
+        model.add_vehicle_type(num_available=1, max_distance=self.budget)
+        for a, row in enumerate(self.distance):
+            for b, value in enumerate(row):
+                model.add_edge(locations[a], locations[b], distance=value)
+        data = model.data()
+        warm = pyvrp.Solution(data, [pyvrp.Route(data, [pyvrp.Activity(pyvrp.ActivityType.CLIENT, client_index[node])
+                                     for node in incumbent[1:-1]], 0)])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.02:
+            return incumbent
+        result = model.solve(stop=MaxRuntime(remaining), seed=seed, display=False,
+                             collect_stats=False, initial_solution=warm)
+        if result.best.is_feasible() and len(result.best.routes()) == 1:
+            candidate = [self.depot] + [clients[activity.idx] for activity in result.best.routes()[0]
+                                        if activity.is_client()] + [self.depot]
+            # PyVRP has no minimum-visit constraint. A too-short tour is rejected
+            # here, leaving the verified three-city incumbent intact.
+            if self.valid(candidate) and (self.value(candidate), -self.length(candidate)) > (self.value(incumbent), -self.length(incumbent)):
+                return candidate
+        return incumbent
+
 
 def solve(instance, time_limit=56.0, seed=0):
     if not math.isfinite(time_limit) or time_limit <= 0:
@@ -178,6 +212,10 @@ def solve(instance, time_limit=56.0, seed=0):
         best = problem.expand_seed(best, preparation_end)
     if time.monotonic() >= deadline or problem.value(best) == sum(problem.prize):
         return problem.output(best)
+    if problem.size > 60 and deadline - time.monotonic() > 1:
+        candidate = problem.genetic_candidate(best, deadline - 0.1, seed)
+        if candidate is not None:
+            return problem.output(candidate)
 
     manager = pywrapcp.RoutingIndexManager(problem.size, 1, problem.depot)
     routing = pywrapcp.RoutingModel(manager)
