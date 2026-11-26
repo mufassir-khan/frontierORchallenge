@@ -1,199 +1,224 @@
-"""Orienteering: connected-tour MILP for small instances, adaptive insertion
-and 2-opt/destroy-repair for large ones. Returns a single feasible cycle with
-at least three distinct cities; preserves an incumbent throughout the search.
+"""Prize-collecting routing model for the FrontierOR orienteering problem.
+
+All cities are optional except the depot; a hard route-length dimension enforces
+its budget and a cardinality constraint requires two nondepot visits. Dropping a
+city costs prize * (budget + 1), making collected prize the primary objective and
+travel length the secondary objective. OR-Tools improves a verified seed tour.
 """
+from __future__ import annotations
+
 import ast
 import heapq
 import math
-import random
 import time
+
 import numpy as np
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+
+def _integer(value, name):
+    number = float(value)
+    if not math.isfinite(number) or number < 0 or number != int(number):
+        raise ValueError(f'{name} must be a nonnegative integer')
+    return int(number)
+
+
+class Orienteering:
+    def __init__(self, instance):
+        self.ids = sorted(int(key) for key in instance['prizes'])
+        if len(self.ids) != instance['n'] or len(self.ids) < 3:
+            raise ValueError('Expected at least three cities and one prize per city')
+        self.index = {node: index for index, node in enumerate(self.ids)}
+        self.depot = self.index[int(instance['depot'])]
+        self.budget = _integer(instance['t0'], 't0')
+        self.prize = [_integer(instance['prizes'][str(node)], 'prize') for node in self.ids]
+        self.size = len(self.ids)
+        self.distance = [[None] * self.size for _ in self.ids]
+        for index in range(self.size):
+            self.distance[index][index] = 0
+        for key, value in instance['travel_times'].items():
+            first, second = ast.literal_eval(key)
+            a, b = self.index[first], self.index[second]
+            cost = _integer(value, 'travel time')
+            self.distance[a][b] = self.distance[b][a] = cost
+        if any(value is None for row in self.distance for value in row):
+            raise ValueError('Missing travel time in the complete graph')
+        if self.prize[self.depot] != 0:
+            raise ValueError('The depot prize must be zero')
+
+    def length(self, tour):
+        return sum(self.distance[a][b] for a, b in zip(tour, tour[1:]))
+
+    def value(self, tour):
+        return sum(self.prize[node] for node in tour[1:-1])
+
+    def valid(self, tour):
+        return (len(tour) >= 4 and tour[0] == tour[-1] == self.depot
+                and len(set(tour[:-1])) == len(tour) - 1
+                and self.length(tour) <= self.budget)
+
+    def seed(self, deadline):
+        """Choose a good triangle, or find a nonmetric cycle via shortest paths."""
+        depot = self.depot
+        others = [node for node in range(self.size) if node != depot]
+        chosen, rank = None, None
+        shortest, shortest_length = None, math.inf
+        for offset, a in enumerate(others):
+            for b in others[offset + 1:]:
+                length = self.distance[depot][a] + self.distance[a][b] + self.distance[b][depot]
+                if length <= self.budget:
+                    if length < shortest_length:
+                        shortest, shortest_length = [depot, a, b, depot], length
+                    score = (self.prize[a] + self.prize[b], -length)
+                    if rank is None or score > rank:
+                        chosen, rank = [depot, a, b, depot], score
+            if time.monotonic() >= deadline:
+                break
+        if chosen is not None:
+            self.shortest_seed = shortest
+            return chosen
+        # The schema promises symmetry, but not triangle inequality. A feasible
+        # longer cycle may exist even when every triangle exceeds the budget.
+        for source in others:
+            if time.monotonic() >= deadline:
+                break
+            labels = {source: 0}
+            previous = {}
+            queue = [(0, source)]
+            while queue and time.monotonic() < deadline:
+                length, node = heapq.heappop(queue)
+                if labels[node] != length:
+                    continue
+                if node != source and self.distance[depot][source] + length + self.distance[node][depot] <= self.budget:
+                    route = [node]
+                    while route[-1] != source:
+                        route.append(previous[route[-1]])
+                    return [depot] + route[::-1] + [depot]
+                for target in others:
+                    if target == node:
+                        continue
+                    candidate = length + self.distance[node][target]
+                    if candidate < labels.get(target, math.inf):
+                        labels[target] = candidate
+                        previous[target] = node
+                        heapq.heappush(queue, (candidate, target))
+        raise RuntimeError('No feasible tour with three cities was found')
+
+    def expand_seed(self, initial, deadline):
+        """Build several prize-aware starting tours before constrained search."""
+        distances = np.asarray(self.distance, dtype=np.int64)
+        prizes = np.asarray(self.prize, dtype=float)
+        best = initial[:]
+
+        def shorten(route):
+            for _ in range(8):
+                if time.monotonic() >= deadline or len(route) < 5:
+                    break
+                ends = np.asarray(route, dtype=int)
+                first, second = ends[:-1], ends[1:]
+                saving = (distances[first[:, None], first] + distances[second[:, None], second]
+                          - distances[first, second][:, None] - distances[first, second])
+                eligible = np.triu(np.ones(saving.shape, dtype=bool), 2)
+                eligible[0, -1] = False
+                eligible &= saving < 0
+                if not np.any(eligible):
+                    break
+                row, column = np.unravel_index(np.argmin(np.where(eligible, saving, 0)), saving.shape)
+                route[row + 1:column + 1] = reversed(route[row + 1:column + 1])
+            return route
+
+        for start in (getattr(self, 'shortest_seed', initial), initial):
+            for exponent in (1.0, 0.7, 1.3):
+                if time.monotonic() >= deadline:
+                    return best
+                route = start[:]
+                for _ in range(3):
+                    route = shorten(route)
+                    total = self.length(route)
+                    visited = set(route)
+                    unused = [v for v in range(self.size) if v not in visited]
+                    while unused and time.monotonic() < deadline:
+                        candidates = np.asarray(unused, dtype=int)
+                        endpoints = np.asarray(route, dtype=int)
+                        extra = (distances[endpoints[:-1, None], candidates]
+                                 + distances[candidates, endpoints[1:, None]]
+                                 - distances[endpoints[:-1], endpoints[1:]][:, None])
+                        positions = extra.argmin(axis=0)
+                        increments = extra[positions, np.arange(len(unused))]
+                        fits = total + increments <= self.budget
+                        if not np.any(fits):
+                            break
+                        priority = (prizes[candidates] + 0.01) / np.maximum(0.1, increments) ** exponent
+                        priority[~fits] = -np.inf
+                        chosen = int(priority.argmax())
+                        route.insert(int(positions[chosen]) + 1, unused.pop(chosen))
+                        total += int(increments[chosen])
+                    if self.valid(route) and (self.value(route), -self.length(route)) > (self.value(best), -self.length(best)):
+                        best = route[:]
+        return best
+
+    def output(self, route):
+        if not self.valid(route):
+            raise RuntimeError('Invalid orienteering incumbent')
+        nodes = [self.ids[node] for node in route]
+        return {'objective_value': float(self.value(route)),
+                'visited_nodes': nodes[:-1],
+                'edges': [[a, b] for a, b in zip(nodes, nodes[1:])],
+                'tour': nodes}
 
 
 def solve(instance, time_limit=56.0, seed=0):
+    if not math.isfinite(time_limit) or time_limit <= 0:
+        raise ValueError('time_limit must be positive and finite')
     deadline = time.monotonic() + time_limit
-    rng = random.Random(seed)
-    ids = sorted(map(int, instance['prizes']))
-    n = len(ids)
-    if n != instance['n'] or n < 3:
-        raise ValueError('Orienteering needs at least three cities')
-    index = {node: j for j, node in enumerate(ids)}
-    depot = index[int(instance['depot'])]
-    prizes = np.array([instance['prizes'][str(node)] for node in ids], dtype=float)
-    distance = np.full((n, n), np.inf)
-    np.fill_diagonal(distance, 0)
-    for key, value in instance['travel_times'].items():
-        i, j = ast.literal_eval(key)
-        a, b = index[i], index[j]
-        distance[a, b] = distance[b, a] = float(value)
-    if not np.isfinite(distance).all() or np.any(distance < 0):
-        raise ValueError('Expected a complete nonnegative symmetric travel-time matrix')
-    budget = float(instance['t0'])
-    other = [v for v in range(n) if v != depot]
+    problem = Orienteering(instance)
+    best = problem.seed(deadline)
+    if problem.size > 60:
+        preparation_end = min(deadline, time.monotonic() + min(7.0, time_limit * 0.15))
+        best = problem.expand_seed(best, preparation_end)
+    if time.monotonic() >= deadline or problem.value(best) == sum(problem.prize):
+        return problem.output(best)
 
-    def length(route):
-        return float(sum(distance[a, b] for a, b in zip(route, route[1:])))
-
-    def reward(route):
-        return float(sum(prizes[v] for v in route[1:-1]))
-
-    triangles = [(distance[depot, a] + distance[a, b] + distance[b, depot], a, b)
-                 for i, a in enumerate(other) for b in other[i+1:]]
-    shortest, a, b = min(triangles)
-    if shortest <= budget + 1e-8:
-        best = [depot, a, b, depot]
-    else:
-        # Arbitrary symmetric matrices need not obey triangle inequality.
-        # Find the shortest depot cycle through >=2 other vertices.
-        best = None
-        for source in other:
-            if time.monotonic() >= deadline:
-                break
-            labels, parent = {source: 0.0}, {}
-            queue = [(0.0, source)]
-            while queue:
-                value, u = heapq.heappop(queue)
-                if value != labels[u]:
-                    continue
-                if u != source and distance[depot, source] + value + distance[u, depot] <= budget:
-                    path, v = [u], u
-                    while v != source:
-                        v = parent[v]; path.append(v)
-                    best = [depot] + list(reversed(path)) + [depot]
-                    break
-                for v in other:
-                    if v == u:
-                        continue
-                    candidate = value + distance[u, v]
-                    if candidate < labels.get(v, math.inf):
-                        labels[v], parent[v] = candidate, u
-                        heapq.heappush(queue, (candidate, v))
-            if best:
-                break
-        if best is None:
-            raise RuntimeError('No feasible cycle with three cities found')
-
-    def two_opt(route, stop):
-        route = route[:]
-        for _ in range(30):
-            if len(route) < 5 or time.monotonic() >= stop:
-                break
-            r = np.asarray(route)
-            a, b = r[:-1], r[1:]
-            delta = distance[a[:, None], a] + distance[b[:, None], b] - distance[a, b][:, None] - distance[a, b]
-            delta[np.tril_indices(len(a), 1)] = np.inf
-            delta[0, -1] = np.inf
-            i, j = np.unravel_index(np.argmin(delta), delta.shape)
-            if delta[i, j] >= -1e-8:
-                break
-            route[i+1:j+1] = reversed(route[i+1:j+1])
-        return route
-
-    def insert(route, alpha, stop):
-        used = set(route)
-        remaining = [v for v in other if v not in used]
-        total = length(route)
-        while remaining and time.monotonic() < stop:
-            candidates = np.asarray(remaining)
-            r = np.asarray(route)
-            delta = distance[r[:-1, None], candidates] + distance[candidates, r[1:, None]] - distance[r[:-1], r[1:]][:, None]
-            places = np.argmin(delta, axis=0)
-            increment = delta[places, np.arange(len(candidates))]
-            feasible = total + increment <= budget + 1e-8
-            if not feasible.any():
-                break
-            score = (prizes[candidates] + 0.01) / np.maximum(0.05, increment) ** alpha
-            score[~feasible] = -np.inf
-            selected = int(np.argmax(score))
-            v = remaining.pop(selected)
-            route.insert(int(places[selected]) + 1, v)
-            total += float(increment[selected])
-        return route
-
-    heuristic_end = deadline if n > 60 else min(deadline, time.monotonic() + time_limit * 0.25)
-    current = best[:]
-    best_value = reward(best)
-    iteration = 0
-    while time.monotonic() < heuristic_end:
-        candidate = two_opt(current, heuristic_end)
-        candidate = insert(candidate, rng.choice([0.7, 1.0, 1.3]), heuristic_end)
-        candidate = two_opt(candidate, heuristic_end)
-        value = reward(candidate)
-        if value > best_value or (value == best_value and length(candidate) < length(best)):
-            best, best_value = candidate[:], value
-        if best_value >= float(sum(prizes)) - 1e-8:
-            break
-        current = (best if iteration % 5 == 0 else candidate)[:]
-        if len(current) > 4:
-            count = rng.randint(1, max(1, min(len(current)-4, len(current)//4)))
-            remove = set(rng.sample(current[1:-1], count))
-            current = [v for v in current if v not in remove]
+    manager = pywrapcp.RoutingIndexManager(problem.size, 1, problem.depot)
+    routing = pywrapcp.RoutingModel(manager)
+    travel = routing.RegisterTransitMatrix(problem.distance)
+    routing.SetArcCostEvaluatorOfAllVehicles(travel)
+    routing.AddDimension(travel, 0, problem.budget, True, 'Travel')
+    scale = problem.budget + 1
+    if sum(problem.prize) * scale + problem.budget >= 2**62:
+        raise ValueError('Objective exceeds safe integer range')
+    active = []
+    for node, prize in enumerate(problem.prize):
+        if node == problem.depot:
+            continue
+        index = manager.NodeToIndex(node)
+        routing.AddDisjunction([index], prize * scale)
+        active.append(routing.ActiveVar(index))
+    routing.solver().Add(routing.solver().Sum(active) >= 2)
+    parameters = pywrapcp.DefaultRoutingSearchParameters()
+    parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.LOCAL_CHEAPEST_INSERTION
+    parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    parameters.log_search = False
+    parameters.sat_parameters.num_search_workers = 1
+    parameters.sat_parameters.random_seed = int(seed) & 0x7fffffff
+    parameters.time_limit.FromMilliseconds(max(1, int((deadline - time.monotonic()) * 1000)))
+    routing.CloseModelWithParameters(parameters)
+    assignment = routing.ReadAssignmentFromRoutes([best[1:-1]], True)
+    remaining = deadline - time.monotonic()
+    if remaining > 0.01:
+        parameters.time_limit.FromMilliseconds(max(1, int(remaining * 1000)))
+        if assignment is not None:
+            assignment = routing.SolveFromAssignmentWithParameters(assignment, parameters)
         else:
-            feasible = [(a, b) for cost, a, b in triangles if cost <= budget]
-            if feasible:
-                a, b = rng.choice(feasible)
-                current = [depot, a, b, depot]
-        if length(current) > budget + 1e-8:
-            # Deletion can increase cost in a nonmetric or rounded matrix.
-            current = best[:]
-        iteration += 1
-    if n <= 60 and deadline - time.monotonic() > 0.1 and best_value < sum(prizes):
-        from scipy.optimize import Bounds, LinearConstraint, milp
-        from scipy.sparse import coo_matrix
-        edges = [(a, b) for a in range(n) for b in range(a+1, n)]
-        e = len(edges)
-        columns = e + n + 2 * e
-        objective = np.zeros(columns)
-        objective[e:e+n] = -prizes
-        upper = np.r_[np.ones(e+n), np.full(2*e, n-1)]
-        lower = np.zeros(columns); lower[e+depot] = 1
-        integrality = np.r_[np.ones(e+n), np.zeros(2*e)]
-        rr, cc, vv, lb, ub = [], [], [], [], []
-
-        def constraint(terms, low, high):
-            r = len(lb); lb.append(low); ub.append(high)
-            for c, v in terms:
-                rr.append(r); cc.append(c); vv.append(v)
-
-        incident = [[] for _ in range(n)]
-        balance = [[] for _ in range(n)]
-        for j, (a, b) in enumerate(edges):
-            incident[a].append((j, 1)); incident[b].append((j, 1))
-            f, g = e+n+2*j, e+n+2*j+1
-            balance[a].extend([(f, -1), (g, 1)])
-            balance[b].extend([(f, 1), (g, -1)])
-            constraint([(f, 1), (j, -(n-1))], -np.inf, 0)
-            constraint([(g, 1), (j, -(n-1))], -np.inf, 0)
-        for v in range(n):
-            constraint(incident[v] + [(e+v, -2)], 0, 0)
-            if v != depot:
-                constraint(balance[v] + [(e+v, -1)], 0, 0)
-        constraint([(j, distance[a, b]) for j, (a, b) in enumerate(edges)], -np.inf, budget)
-        constraint([(e+v, 1) for v in range(n)], 3, np.inf)
-        constraint([(e+v, prizes[v]) for v in range(n)], best_value, np.inf)
-        matrix = coo_matrix((vv, (rr, cc)), shape=(len(lb), columns)).tocsc()
-        result = milp(objective, integrality=integrality, bounds=Bounds(lower, upper),
-                      constraints=LinearConstraint(matrix, lb, ub),
-                      options={'time_limit': max(0.001, deadline-time.monotonic()), 'mip_rel_gap': 0.0})
-        if result.x is not None:
-            adjacency = {v: [] for v in range(n)}
-            for j, (a, b) in enumerate(edges):
-                if result.x[j] > 0.5:
-                    adjacency[a].append(b); adjacency[b].append(a)
-            route, previous, v = [depot], None, depot
-            for _ in range(n):
-                options = [u for u in adjacency[v] if u != previous]
-                if not options:
+            assignment = routing.SolveWithParameters(parameters)
+        if assignment is not None:
+            index = routing.Start(0)
+            candidate = [problem.depot]
+            for _ in range(problem.size + 1):
+                index = assignment.Value(routing.NextVar(index))
+                candidate.append(manager.IndexToNode(index))
+                if routing.IsEnd(index):
                     break
-                u = options[0]; route.append(u)
-                previous, v = v, u
-                if v == depot:
-                    break
-            if (route[-1] == depot and len(route) >= 4 and len(set(route[:-1])) == len(route)-1
-                    and length(route) <= budget + 1e-6 and reward(route) >= best_value):
-                best = route
-    tour = [ids[v] for v in best]
-    if length(best) > budget + 1e-6 or len(set(best[:-1])) != len(best)-1 or len(best) < 4:
-        raise RuntimeError('Invalid final tour')
-    return {'objective_value': reward(best), 'visited_nodes': tour[:-1],
-            'edges': [[a, b] for a, b in zip(tour, tour[1:])], 'tour': tour}
+            if problem.valid(candidate) and (problem.value(candidate), -problem.length(candidate)) >= (problem.value(best), -problem.length(best)):
+                best = candidate
+    return problem.output(best)

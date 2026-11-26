@@ -1,231 +1,248 @@
-#!/usr/bin/env python3
-"""Dependency-free DARP heuristic. Usage: python solve.py instance.json -o solution.json.
+"""DARP solver: floating-point feasibility plus OR-Tools paired-route search.
 
-Uses regret insertion and randomized destroy/repair. Feasible solutions are
-validated before output; optimality and finding a feasible solution are not
-guaranteed. Input time windows are used as supplied (including any tightening).
+The routing search uses conservative integer travel times. Every candidate
+returned to the caller is rescheduled with the original Euclidean distances.
+Optional search nodes are only a construction aid: partial service is NEVER
+accepted as a solution. Vehicle and request identifiers are not conflated.
 """
 from __future__ import annotations
 
+from collections import deque
 import math
 import random
 import time
 
 
-class SearchTimeout(Exception):
-    pass
-
-
 class DARP:
-    def __init__(self, instance, deadline=float('inf')):
-        self.deadline = deadline
-        self.nodes = {int(v['node_id']): v for v in instance['nodes']}
+    """Instance data and an independent exact-distance route validator."""
+
+    def __init__(self, instance):
         self.n = int(instance['num_users'])
         self.m = int(instance['num_vehicles'])
-        self.cap = float(instance['vehicle_capacity'])
-        self.ride_limit = float(instance['maximum_ride_time'])
-        self.duration = float(instance['maximum_route_duration'])
-        self.start, self.end = 0, 2 * self.n + 1
-        if (len(self.nodes) != instance['num_nodes'] or
-                set(self.nodes) != set(range(2 * self.n + 2))):
-            raise ValueError('Expected unique node IDs 0 through 2 * num_users + 1.')
-        if self.m < 1 or min(self.cap, self.ride_limit, self.duration) < 0:
-            raise ValueError('Invalid vehicle count or limits.')
-        self.pairs = {}
-        self.users = {}
-        for i, v in self.nodes.items():
-            for field in ('x', 'y', 'earliest_time', 'latest_time', 'service_duration', 'load'):
-                if not math.isfinite(float(v[field])):
-                    raise ValueError(f'Nonfinite {field} at node {i}.')
-            if v['earliest_time'] > v['latest_time'] or v['service_duration'] < 0:
-                raise ValueError(f'Invalid time bounds at node {i}.')
-            if v['node_type'] == 'pickup':
-                d = int(v['paired_node'])
-                drop = self.nodes[d]
-                if (drop['node_type'] != 'dropoff' or drop['paired_node'] != i or
-                        drop['user_id'] != v['user_id'] or v['load'] <= 0 or
-                        drop['load'] != -v['load']):
-                    raise ValueError(f'Invalid pickup/drop-off pairing at node {i}.')
-                self.pairs[i] = d
-                self.users[i] = str(v['user_id'])
-        if (len(self.pairs) != self.n or len(set(self.users.values())) != self.n or
-                set(self.pairs) | set(self.pairs.values()) != set(range(1, self.end))):
-            raise ValueError('Invalid user/node coverage.')
-        for i, kind in ((self.start, 'origin_depot'), (self.end, 'destination_depot')):
-            if self.nodes[i]['node_type'] != kind or self.nodes[i]['load'] != 0 or self.nodes[i]['service_duration'] != 0:
-                raise ValueError('Depots must have the correct type, zero load and zero service.')
-        self.dist = [[math.hypot(self.nodes[i]['x'] - self.nodes[j]['x'],
-                                 self.nodes[i]['y'] - self.nodes[j]['y'])
-                      for j in range(self.end + 1)] for i in range(self.end + 1)]
-
-    def check_time(self):
-        if time.monotonic() >= self.deadline:
-            raise SearchTimeout
+        self.end = 2*self.n+1
+        self.capacity = int(instance['vehicle_capacity'])
+        self.max_ride = float(instance['maximum_ride_time'])
+        self.max_duration = float(instance['maximum_route_duration'])
+        self.nodes = sorted(instance['nodes'], key=lambda node: node['node_id'])
+        if (instance['num_nodes'] != self.end+1 or
+                [v['node_id'] for v in self.nodes] != list(range(self.end+1)) or self.m < 1):
+            raise ValueError('Invalid node or vehicle counts')
+        self.early = [float(v['earliest_time']) for v in self.nodes]
+        self.late = [float(v['latest_time']) for v in self.nodes]
+        self.service = [float(v['service_duration']) for v in self.nodes]
+        self.load = [int(v['load']) for v in self.nodes]
+        for i in range(self.end+1):
+            if (not all(math.isfinite(x) for x in (self.early[i], self.late[i], self.service[i]))
+                    or self.early[i] > self.late[i] or self.service[i] < 0):
+                raise ValueError('Invalid node time data')
+        self.pairs = {v['node_id']: int(v['paired_node']) for v in self.nodes if v['node_type'] == 'pickup'}
+        if len(self.pairs) != self.n or set(self.pairs) | set(self.pairs.values()) != set(range(1, self.end)):
+            raise ValueError('Every request needs a distinct pickup and delivery')
+        for p, d in self.pairs.items():
+            if (self.nodes[d]['node_type'] != 'dropoff' or self.nodes[d]['paired_node'] != p
+                    or self.nodes[p]['user_id'] != self.nodes[d]['user_id']
+                    or self.load[p] <= 0 or self.load[d] != -self.load[p]):
+                raise ValueError('Inconsistent pickup/dropoff pairing')
+        self.distance = [[math.hypot(a['x']-b['x'], a['y']-b['y']) for b in self.nodes] for a in self.nodes]
 
     def cost(self, route):
-        return sum(self.dist[a][b] for a, b in zip(route, route[1:]))
+        return sum(self.distance[a][b] for a, b in zip(route, route[1:]))
 
     def schedule(self, route):
-        """Solve difference constraints by longest-path relaxation.
+        """Queue relaxation of time-window/ride/route-duration inequalities.
 
-        Reverse edges impose ride-time and route-duration upper bounds. Thus
-        waiting can be shifted before pickups or before depot departure.
+        A bound t[b] >= t[a] + w is an edge a->b of weight w. Upper
+        ride and duration limits create backward edges, shifting waiting time
+        before the pickup/depot instead of wrongly declaring a route infeasible.
         """
-        self.check_time()
-        if route[0] != self.start or route[-1] != self.end or len(set(route)) != len(route):
+        if not route or route[0] != 0 or route[-1] != self.end or len(set(route)) != len(route):
             return None
-        positions = {v: i for i, v in enumerate(route)}
-        load = 0
-        for node in route:
-            change = self.nodes[node]['load']
-            load += change
-            if load < max(0, change) - 1e-8 or load > min(self.cap, self.cap + change) + 1e-8:
+        index = {node: position for position, node in enumerate(route)}
+        onboard = 0
+        graph = [[] for _ in route]
+        for i, node in enumerate(route):
+            onboard += self.load[node]
+            if onboard < max(0, self.load[node]) or onboard > min(self.capacity, self.capacity+self.load[node]):
                 return None
-        if abs(load) > 1e-8:
+            if i:
+                previous = route[i-1]
+                graph[i-1].append((i, self.service[previous]+self.distance[previous][node]))
+        if onboard:
             return None
-        edges = [(i, i + 1, self.nodes[a]['service_duration'] + self.dist[a][b])
-                 for i, (a, b) in enumerate(zip(route, route[1:]))]
         for p, d in self.pairs.items():
-            if (p in positions) != (d in positions):
+            if (p in index) != (d in index):
                 return None
-            if p in positions:
-                if positions[p] >= positions[d]:
+            if p in index:
+                a, b = index[p], index[d]
+                if a >= b:
                     return None
-                service = self.nodes[p]['service_duration']
-                edges.append((positions[d], positions[p], -service - self.ride_limit))
-                edges.append((positions[p], positions[d], service + self.dist[p][d]))
-        edges.append((len(route) - 1, 0, -self.duration))
-        times = [float(self.nodes[v]['earliest_time']) for v in route]
-        upper = [float(self.nodes[v]['latest_time']) for v in route]
-        for _ in range(len(route)):
-            changed = False
-            for a, b, w in edges:
-                candidate = times[a] + w
-                if candidate > times[b] + 1e-9:
-                    if candidate > upper[b] + 1e-8:
+                graph[a].append((b, self.service[p]+self.distance[p][d]))
+                graph[b].append((a, -self.service[p]-self.max_ride))
+        graph[-1].append((0, -self.max_duration))
+        values = [self.early[v] for v in route]
+        queue = deque(range(len(route)))
+        queued = [True]*len(route)
+        depth = [0]*len(route)
+        while queue:
+            a = queue.popleft(); queued[a] = False
+            for b, amount in graph[a]:
+                candidate = values[a]+amount
+                if candidate > values[b]+1e-10:
+                    if candidate > self.late[route[b]]+1e-8:
                         return None
-                    times[b] = candidate
-                    changed = True
-            if not changed:
-                return times
-        return None  # Positive cycle: incompatible timing constraints.
+                    values[b] = candidate
+                    depth[b] = depth[a]+1
+                    if depth[b] >= len(route):
+                        return None
+                    if not queued[b]:
+                        queue.append(b); queued[b] = True
+        return values
 
-    def options(self, routes, p, limit=2):
-        """Best feasible insertion per vehicle; retain the best two vehicles."""
-        d = self.pairs[p]
-        options = []
-        seen = set()
-        for k, route in enumerate(routes):
-            self.check_time()
-            signature = tuple(route)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            candidates = []
-            for i in range(1, len(route)):
-                with_pickup = route[:i] + [p] + route[i:]
-                pickup_delta = self.dist[route[i-1]][p] + self.dist[p][route[i]] - self.dist[route[i-1]][route[i]]
-                for j in range(i + 1, len(with_pickup)):
-                    a, b = with_pickup[j-1:j+1]
-                    delta = pickup_delta + self.dist[a][d] + self.dist[d][b] - self.dist[a][b]
-                    candidates.append((delta, i, j))
-            candidates.sort()
-            for delta, i, j in candidates:
-                self.check_time()
-                candidate = route[:i] + [p] + route[i:]
-                candidate.insert(j, d)
-                if self.schedule(candidate) is not None:
-                    options.append((delta, k, candidate))
-                    break
-        options.sort(key=lambda item: item[0])
-        return options[:limit]
-
-    def repair(self, routes, remaining, rng, noise=0.0):
-        routes = [r[:] for r in routes]
-        remaining = set(remaining)
-        while remaining:
-            chosen = None
-            best_priority = -float('inf')
-            for p in sorted(remaining):
-                self.check_time()
-                opts = self.options(routes, p)
-                if not opts:
-                    return None
-                regret = opts[1][0] - opts[0][0] if len(opts) > 1 else 1e6
-                priority = regret - 0.01 * opts[0][0] + noise * rng.random()
-                if priority > best_priority:
-                    best_priority, chosen = priority, (p, opts[0])
-            p, (_, k, route) = chosen
-            routes[k] = route
-            remaining.remove(p)
-        return routes
-
-    def output(self, routes):
-        visited = [v for r in routes for v in r[1:-1]]
-        if len(routes) != self.m or sorted(visited) != list(range(1, self.end)):
-            raise ValueError('Solution does not serve every user exactly once.')
-        result = {'objective_value': sum(self.cost(r) for r in routes),
-                  'routes': {}, 'service_times': {}, 'ride_times': {}}
-        for k, route in enumerate(routes):
+    def result(self, routes):
+        visits = [v for route in routes for v in route[1:-1]]
+        if len(routes) != self.m or sorted(visits) != list(range(1, self.end)):
+            raise ValueError('A complete solution must serve every request exactly once')
+        service_times, ride_times = {}, {}
+        for vehicle, route in enumerate(routes):
             times = self.schedule(route)
             if times is None:
-                raise ValueError('Invalid route in final solution.')
-            result['routes'][str(k)] = route
-            result['service_times'][f'depot_start_{k}'] = times[0]
-            result['service_times'][f'depot_end_{k}'] = times[-1]
+                raise ValueError('Final route failed schedule/capacity validation')
             by_node = dict(zip(route, times))
-            result['service_times'].update({str(v): by_node[v] for v in route[1:-1]})
+            service_times[f'depot_start_{vehicle}'] = times[0]
+            service_times[f'depot_end_{vehicle}'] = times[-1]
+            service_times.update({str(v): by_node[v] for v in route[1:-1]})
             for p, d in self.pairs.items():
                 if p in by_node:
-                    # The challenge checker indexes requests by pickup node,
-                    # not by the optional external user identifier.
-                    result['ride_times'][str(p)] = by_node[d] - by_node[p] - self.nodes[p]['service_duration']
-        return result
+                    # The published checker keys ride times by pickup node ID.
+                    ride_times[str(p)] = by_node[d]-by_node[p]-self.service[p]
+        return {'objective_value': float(sum(map(self.cost, routes))),
+                'routes': {str(k): route for k, route in enumerate(routes)},
+                'service_times': service_times, 'ride_times': ride_times}
 
 
-def solve(instance, time_limit=60.0, seed=0):
-    """Return a schema-compatible solution, or raise if none was found in time."""
-    if not math.isfinite(time_limit) or time_limit <= 0:
-        raise ValueError('time_limit must be positive and finite.')
-    started = time.monotonic()
-    problem = DARP(instance, started + time_limit * 0.98)
-    rng = random.Random(seed)
-    best = None
-    best_cost = float('inf')
-    current = None
-    attempts = 0
-    try:
-        empty = [[problem.start, problem.end] for _ in range(problem.m)]
-        if any(problem.schedule(r) is None for r in empty):
-            raise ValueError('Depot-only route is infeasible under the supplied bounds.')
-        while True:
-            problem.check_time()
-            attempts += 1
-            if current is None:
-                candidate = problem.repair(empty, problem.pairs, rng, 0 if attempts == 1 else 1e6)
-            else:
-                count = rng.randint(1, max(1, min(problem.n, math.ceil(problem.n * 0.35))))
-                removed = set(rng.sample(list(problem.pairs), count))
-                nodes = removed | {problem.pairs[p] for p in removed}
-                partial = [[v for v in route if v not in nodes] for route in current]
-                candidate = problem.repair(partial, removed, rng, rng.choice([0, 10, 100, 1e6]))
-            if candidate is None:
-                continue
-            cost = sum(problem.cost(r) for r in candidate)
-            if cost < best_cost:
-                best, best_cost = [r[:] for r in candidate], cost
-            if current is None or cost <= current_cost:
-                current, current_cost = candidate, cost
-            else:
-                fraction = min(1.0, (time.monotonic() - started) / time_limit)
-                temperature = max(1e-9, best_cost * 0.02 * (1 - fraction))
-                if rng.random() < math.exp(-(cost - current_cost) / temperature):
-                    current, current_cost = candidate, cost
-            if problem.n <= 1:
+def _construct(data, deadline, rng):
+    """Deadline-bounded, exact-distance insertion seed for the routing engine."""
+    attempt = 0
+    while time.monotonic() < deadline:
+        routes = [[0, data.end] for _ in range(data.m)]
+        order = sorted(data.pairs, key=lambda p: (data.late[p] if attempt == 0 else
+                       data.late[p]+rng.uniform(-80,80)))
+        for p in order:
+            choices = []
+            seen = set()
+            for k, route in enumerate(routes):
+                if tuple(route) in seen:
+                    continue
+                seen.add(tuple(route))
+                for i in range(1, len(route)):
+                    picked = route[:i]+[p]+route[i:]
+                    for j in range(i+1, len(picked)):
+                        if time.monotonic() >= deadline:
+                            return None
+                        candidate = picked[:j]+[data.pairs[p]]+picked[j:]
+                        increment = data.cost(candidate)-data.cost(route)
+                        choices.append((increment, k, candidate))
+            choices.sort(key=lambda item: item[0])
+            chosen = None
+            for _, k, route in choices:
+                if time.monotonic() >= deadline:
+                    return None
+                if data.schedule(route) is not None:
+                    chosen = k, route
+                    break
+            if chosen is None:
                 break
-    except SearchTimeout:
-        pass
-    if best is None:
-        raise RuntimeError('No feasible solution found within the time limit; infeasibility is not proven.')
-    problem.deadline = float('inf')  # Reserve the final budget for validation/serialization.
-    return problem.output(best)
+            k, route = chosen
+            routes[k] = route
+        else:
+            return routes
+        attempt += 1
+    return None
+
+
+def _routing_search(data, incumbent, deadline):
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+    scale = 1_000_000
+    shift = min(data.early)
+    ceil = lambda x: int(math.ceil(x*scale-1e-7))
+    floor = lambda x: int(math.floor(x*scale+1e-7))
+    horizon = ceil(max(data.late)-shift)+1
+    manager = pywrapcp.RoutingIndexManager(data.end+1, data.m, [0]*data.m, [data.end]*data.m)
+    routing = pywrapcp.RoutingModel(manager)
+    index_nodes = [manager.IndexToNode(i) for i in range(manager.GetNumberOfIndices())]
+    metric = [[int(round(v*10000)) for v in row] for row in data.distance]
+    transit = [[ceil(data.service[a]+data.distance[a][b]) for b in range(data.end+1)] for a in range(data.end+1)]
+    cost_callback = routing.RegisterTransitCallback(lambda a,b: metric[index_nodes[a]][index_nodes[b]])
+    routing.SetArcCostEvaluatorOfAllVehicles(cost_callback)
+    time_callback = routing.RegisterTransitCallback(lambda a,b: transit[index_nodes[a]][index_nodes[b]])
+    routing.AddDimension(time_callback, horizon, horizon, False, 'Time')
+    clock = routing.GetDimensionOrDie('Time')
+    load_callback = routing.RegisterUnaryTransitCallback(lambda a: data.load[index_nodes[a]])
+    routing.AddDimensionWithVehicleCapacity(load_callback, 0, [data.capacity]*data.m, True, 'Passengers')
+    cp = routing.solver()
+    penalty = max(1, sum(max(row) for row in metric)) * 100
+    for node in range(1, data.end):
+        index = manager.NodeToIndex(node)
+        clock.CumulVar(index).SetRange(ceil(data.early[node]-shift), floor(data.late[node]-shift))
+        routing.AddDisjunction([index], penalty)
+    for vehicle in range(data.m):
+        start, finish = routing.Start(vehicle), routing.End(vehicle)
+        clock.CumulVar(start).SetRange(ceil(data.early[0]-shift), floor(data.late[0]-shift))
+        clock.CumulVar(finish).SetRange(ceil(data.early[-1]-shift), floor(data.late[-1]-shift))
+        clock.SetSpanUpperBoundForVehicle(floor(data.max_duration), vehicle)
+    for p, d in data.pairs.items():
+        a, b = manager.NodeToIndex(p), manager.NodeToIndex(d)
+        routing.AddPickupAndDelivery(a,b)
+        cp.Add(routing.VehicleVar(a) == routing.VehicleVar(b))
+        cp.Add(routing.ActiveVar(a) == routing.ActiveVar(b))
+        cp.Add(clock.CumulVar(b)-clock.CumulVar(a) >= ceil(data.service[p]+data.distance[p][d]))
+        cp.Add(clock.CumulVar(b)-clock.CumulVar(a) <= floor(data.service[p]+data.max_ride))
+    parameters = pywrapcp.DefaultRoutingSearchParameters()
+    parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    parameters.time_limit.FromMilliseconds(max(1, int((deadline-time.monotonic())*1000)))
+    parameters.log_search = False
+    # The exact-distance seed can be infeasible after conservative rounding;
+    # discard only the rounded assignment, retaining the valid external seed.
+    assignment = routing.ReadAssignmentFromRoutes([r[1:-1] for r in incumbent], True) if incumbent else None
+    if time.monotonic() >= deadline:
+        return incumbent
+    parameters.time_limit.FromMilliseconds(max(1, int((deadline-time.monotonic())*1000)))
+    solution = (routing.SolveFromAssignmentWithParameters(assignment, parameters) if assignment
+                else routing.SolveWithParameters(parameters))
+    if solution is None:
+        return incumbent
+    routes = []
+    for k in range(data.m):
+        index = routing.Start(k)
+        route = []
+        while not routing.IsEnd(index):
+            route.append(manager.IndexToNode(index))
+            index = solution.Value(routing.NextVar(index))
+        route.append(data.end)
+        routes.append(route)
+    try:
+        data.result(routes)
+    except ValueError:
+        return incumbent
+    if incumbent is None or sum(map(data.cost,routes)) < sum(map(data.cost,incumbent)):
+        return routes
+    return incumbent
+
+
+def solve(instance, time_limit=55.0, seed=0):
+    if not math.isfinite(time_limit) or time_limit <= 0:
+        raise ValueError('time_limit must be finite and positive')
+    began = time.monotonic()
+    data = DARP(instance)
+    deadline = began + time_limit*0.98
+    rng = random.Random(seed)
+    incumbent = _construct(data, min(deadline, time.monotonic()+min(3.0,time_limit*0.12)), rng)
+    if data.n <= 1 and incumbent is not None:
+        return data.result(incumbent)
+    if time.monotonic() < deadline:
+        incumbent = _routing_search(data, incumbent, deadline)
+    if incumbent is None:
+        raise RuntimeError('No complete feasible DARP solution found before the search deadline')
+    return data.result(incumbent)
