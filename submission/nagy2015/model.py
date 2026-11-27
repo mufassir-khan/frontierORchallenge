@@ -134,7 +134,7 @@ class DeliveryRouting:
                            for vehicle in range(self.n)])
         model.add_job([vroom.Job(node, location=node, delivery=[self.delivery[node]],
                                 pickup=[self.pickup[node]]) for node in range(1, 2 * self.n + 1)])
-        result = model.solve(exploration_level=5, nb_threads=2,
+        result = model.solve(exploration_level=5, nb_threads=1 if __import__("os").environ.get("PORTFOLIO_WORKER") else 2,
                              timeout=timedelta(seconds=max(0.01, seconds))).to_dict()
         if result.get('unassigned'):
             return None
@@ -177,28 +177,49 @@ class DeliveryRouting:
         return routes
 
 
-def solve(instance, time_limit=56.0, seed=0):
+def solve(instance, time_limit=56.0, seed=0, warm_start=None, search_method="guided"):
     if not math.isfinite(time_limit) or time_limit <= 0:
         raise ValueError('time_limit must be positive and finite')
     deadline = time.monotonic() + time_limit
     problem = DeliveryRouting(instance)
+    build_started=time.monotonic()
     best = problem.starting_routes(deadline, seed)
+    build_seconds=time.monotonic()-build_started
+    if warm_start is not None:
+        routes = [r[1:-1] for r in warm_start['routes']]
+        problem.output(routes)
+        if sum(map(problem.cost, routes)) < sum(map(problem.cost, best)):
+            best = routes
+    def progress(stage):
+        import os, sys
+        if os.environ.get('FRONTIER_PROGRESS') == '1':
+            print(f'[worker seed={seed}] {stage}; best objective={sum(map(problem.cost, best))}',file=sys.stderr,flush=True)
+    import os, sys
+    if os.environ.get('FRONTIER_PROGRESS') == '1':
+        problem.output(best)
+        worker=os.environ.get('FRONTIER_WORKER', '1')
+        print(f'Worker {worker}: initial feasible objective={sum(map(problem.cost,best))}, routes={len(best)}, seed built in {build_seconds:.2f}s',file=sys.stderr,flush=True)
+    progress('initial solution ready')
     remaining = deadline - time.monotonic()
-    if remaining > 1:
+    if remaining > 1 and search_method != 'annealing':
         try:
+            progress('starting VROOM')
             candidate = problem.vroom_candidate(min(12.0, remaining * 0.25))
         except (ImportError, ValueError, RuntimeError, TypeError, AttributeError):
             candidate = None  # Keep the validated seed if an optional engine fails.
         if candidate is not None and sum(map(problem.cost, candidate)) < sum(map(problem.cost, best)):
             best = candidate
-    if deadline - time.monotonic() > 1:
+    progress('VROOM stage complete or skipped')
+    if deadline - time.monotonic() > 1 and search_method != 'annealing':
         try:
+            progress('starting PyVRP')
             candidate = problem.genetic_candidate(best, deadline - 0.1, seed)
         except (ImportError, ValueError, RuntimeError, TypeError, AttributeError):
             candidate = None
         if candidate is not None:
             if sum(map(problem.cost, candidate)) < sum(map(problem.cost, best)):
                 best = candidate
+            progress('PyVRP complete')
             return problem.output(best)
     if time.monotonic() >= deadline:
         return problem.output(best)
@@ -220,7 +241,7 @@ def solve(instance, time_limit=56.0, seed=0):
         routing.NextVar(manager.NodeToIndex(customer + problem.n)).RemoveValue(manager.NodeToIndex(customer))
     parameters = pywrapcp.DefaultRoutingSearchParameters()
     parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    parameters.local_search_metaheuristic = (routing_enums_pb2.LocalSearchMetaheuristic.SIMULATED_ANNEALING if search_method == 'annealing' else routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
     parameters.log_search = False
     parameters.sat_parameters.num_search_workers = 1
     parameters.sat_parameters.random_seed = int(seed) & 0x7fffffff
@@ -230,6 +251,7 @@ def solve(instance, time_limit=56.0, seed=0):
     remaining = deadline - time.monotonic()
     if remaining > 0.01 and assignment is not None:
         parameters.time_limit.FromMilliseconds(max(1, int(remaining * 1000)))
+        progress('starting OR-Tools local search')
         solution = routing.SolveFromAssignmentWithParameters(assignment, parameters)
         if solution is not None:
             routes = []
